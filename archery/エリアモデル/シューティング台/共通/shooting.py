@@ -55,7 +55,7 @@ KERF = 0.003                  # のこ刃の厚み
 PIPE_D = 0.0486
 
 PLANS = OrderedDict([
-    ("パイプ台", "単管を切った杭(先端キャップ付き)と単管の梁に、赤松の根太と 2×6 の床板を張る台。床いっぱいに人が乗っても持つ杭の配置"),
+    ("パイプ台", "単管を切った杭(先端キャップ付き)と単管の梁に、赤松の根太と 2×6 の床板を張る台。射手が 1m おきに立ち、後ろに荷物を置いても持つ杭の配置"),
     ("排水作戦", "溝を掘って暗渠管と砕石を入れ、端の浸透ますへ水を逃がす"),
     ("ブロック", "砕石を敷き、ブロックを並べて防腐角材の根太と 2×6 の床板を張る"),
     ("砂", "透水シートの上に砂を 10cm 敷いて嵩上げし、周りをブロックで留める"),
@@ -349,8 +349,14 @@ def plan_sand(W, D):
 
 # ---------------------------------------------------------------- パイプ台の強さ
 
-LIVE = 1.8          # kN/m² 床いっぱいに人が乗る(住宅の床の構造計算と同じ値)
-DEAD = 0.3          # kN/m² 床板と根太の重さ
+DEAD = 0.3          # kN/m² 床板と根太の重さ(全面)
+# 荷重の場合。射手: 前の帯に射手が 1m おきに立ち、後ろは荷物置き場。床いっぱい: 全面に人が乗る。
+LOADS = OrderedDict([
+    ("射手", dict(front=1.0, person=0.8, stand=(0.2, 0.8), luggage=1.0, live=0.0)),
+    ("床いっぱい", dict(front=0.0, person=0.0, stand=(0.2, 0.8), luggage=0.0, live=1.8)),
+])
+DESIGN_LOAD = "射手"
+PERSON_JOISTS = 2   # 射手1人の重さを受ける根太の本数(床板が2本以上にまたがる)
 PIPE_I = math.pi / 64 * (48.6**4 - 45.0**4)      # mm⁴ 単管 φ48.6×1.8
 PIPE_Z = PIPE_I / 24.3
 STEEL_E, STEEL_FB = 205000, 355 / 1.5            # N/mm² STK500 相当の長期許容曲げ
@@ -360,24 +366,94 @@ CLAMP_KN = 2.45     # kN 自在クランプ1個で支える許容(一般的な�
 DEFL = 300          # たわみの限度 L/300
 
 
-def pipe_check(W, D, cols=None, rows=None):
-    """梁(単管)・根太・クランプの確かめ。比は 1 以下なら合格。梁と根太は単純梁で計算(安全側)。"""
+def cont_reactions(sup, loads):
+    """支点 sup(昇順)に載る多径間の連続梁で、点荷重 loads=[(位置, 力)] の各支点の反力。三連モーメント式。"""
+    n = len(sup)
+    Ls = [sup[i + 1] - sup[i] for i in range(n - 1)]
+
+    def span_of(y):
+        for i in range(n - 1):
+            if y <= sup[i + 1] + 1e-12:
+                return i
+        return n - 2
+
+    T = [[0.0, 0.0] for _ in Ls]   # 各径間の左支点側・右支点側の荷重項
+    for y, P in loads:
+        i = span_of(y)
+        a = y - sup[i]
+        b = Ls[i] - a
+        T[i][1] += P * a * (Ls[i] ** 2 - a * a) / Ls[i]
+        T[i][0] += P * b * (Ls[i] ** 2 - b * b) / Ls[i]
+    m = n - 2
+    A = [[0.0] * m for _ in range(m)]
+    rhs = [0.0] * m
+    for i in range(m):
+        if i > 0:
+            A[i][i - 1] = Ls[i]
+        A[i][i] = 2 * (Ls[i] + Ls[i + 1])
+        if i < m - 1:
+            A[i][i + 1] = Ls[i + 1]
+        rhs[i] = -(T[i][1] + T[i + 1][0])
+    for i in range(m):
+        for j in range(i + 1, m):
+            f = A[j][i] / A[i][i]
+            A[j] = [x - f * y for x, y in zip(A[j], A[i])]
+            rhs[j] -= f * rhs[i]
+    M = [0.0] * m
+    for i in reversed(range(m)):
+        M[i] = (rhs[i] - sum(A[i][k] * M[k] for k in range(i + 1, m))) / A[i][i]
+    M = [0.0] + M + [0.0]
+    R = [0.0] * n
+    for y, P in loads:
+        i = span_of(y)
+        R[i] += P * (sup[i + 1] - y) / Ls[i]
+        R[i + 1] += P * (y - sup[i]) / Ls[i]
+    for i, L in enumerate(Ls):
+        d = (M[i + 1] - M[i]) / L      # 支点モーメント(負が上に凸)による反力の増減
+        R[i] += d
+        R[i + 1] -= d
+    return R
+
+
+def _strip(a, b, q, step=0.005):
+    return [(a + (i + 0.5) * step, q * step) for i in range(max(0, int(round((b - a) / step))))]
+
+
+def pipe_check(W, D, cols=None, rows=None, case=DESIGN_LOAD):
+    """梁(単管)・根太・クランプの確かめ。比は 1 以下なら合格。
+    梁と根太は単純梁で曲げとたわみを出す(安全側)。各梁への荷重の分かれ方だけ、根太を連続梁として解く。"""
+    c = LOADS[case]
     p = plan_pipe(W, D, cols=cols, rows=rows)
     xs, ys = p["xs"], p["ys"]
     sp, rs = xs[1] - xs[0], ys[1] - ys[0]
-    q = LIVE + DEAD
-    jw = q * JOIST_PITCH                         # 根太の線荷重 kN/m = N/mm
-    jL = rs * 1000
-    bw = q * rs * (1.25 if len(ys) > 2 else 0.5)  # 中の梁は根太の連続で 1.25 倍受ける
+    clamp = lambda y: min(max(y, ys[0]), ys[-1])  # 張り出し部分の荷重は端の梁に寄せる
+    # 根太1本(幅 JOIST_PITCH)あたりの分布荷重 → 各梁の線荷重 kN/m
+    uni = (_strip(0, D, (DEAD + c["live"]) * JOIST_PITCH)
+           + _strip(c["front"], D, c["luggage"] * JOIST_PITCH))
+    w_rows = [r / JOIST_PITCH for r in cont_reactions(ys, [(clamp(y), f) for y, f in uni])]
+    # 射手1人が各梁へ行く割合(立つ位置を前の帯の中で動かした最大)
+    share = [0.0] * len(ys)
+    if c["person"]:
+        lo, hi = c["stand"]
+        for k in range(13):
+            y = lo + (hi - lo) * k / 12
+            share = [max(f, r) for f, r in zip(share, cont_reactions(ys, [(clamp(y), 1.0)]))]
     bL = sp * 1000
-    R = bw * sp                                   # 杭1本(クランプ1個)の荷重 kN
+    bsig = bdl = R = 0.0
+    for w, f in zip(w_rows, share):
+        P = f * c["person"] * 1000                  # N。人は梁の真ん中に立つ
+        bsig = max(bsig, (w * bL**2 / 8 + P * bL / 4) / PIPE_Z / STEEL_FB)
+        bdl = max(bdl, (5 * w * bL**4 / 384 + P * bL**3 / 48) / (STEEL_E * PIPE_I) / (bL / DEFL))
+        R = max(R, w * sp + f * c["person"])         # 人は杭の真上に立つ
+    jL = rs * 1000
+    jw = (DEAD + c["live"] + c["luggage"]) * JOIST_PITCH
+    jP = c["person"] * 1000 / PERSON_JOISTS
     return OrderedDict([
         ("配置", f"{len(xs)}×{len(ys)}"), ("杭", len(xs) * len(ys)),
         ("間隔", f"{sp:.2f}m × {rs:.2f}m"),
-        ("梁の曲げ", bw * bL**2 / 8 / PIPE_Z / STEEL_FB),
-        ("梁のたわみ", 5 * bw * bL**4 / (384 * STEEL_E * PIPE_I) / (bL / DEFL)),
-        ("根太の曲げ", jw * jL**2 / 8 / JOIST_Z / WOOD_FB),
-        ("根太のたわみ", 5 * jw * jL**4 / (384 * WOOD_E * JOIST_I) / (jL / DEFL)),
+        ("梁の曲げ", bsig), ("梁のたわみ", bdl),
+        ("根太の曲げ", (jw * jL**2 / 8 + jP * jL / 4) / JOIST_Z / WOOD_FB),
+        ("根太のたわみ", (5 * jw * jL**4 / 384 + jP * jL**3 / 48) / (WOOD_E * JOIST_I) / (jL / DEFL)),
         ("杭1本の荷重", R / CLAMP_KN),
         ("杭1本の荷重kN", R),
     ])
@@ -387,12 +463,12 @@ RATIOS = ["梁の曲げ", "梁のたわみ", "根太の曲げ", "根太のたわ
 
 
 @functools.lru_cache(maxsize=None)
-def safe_layout(W, D):
+def safe_layout(W, D, case=DESIGN_LOAD):
     """全部の比が 1 以下になる配置のうち、一番安いもの(列数, 行数)。"""
     best = None
     for rows in range(3, 7):
         for cols in range(3, 40):
-            c = pipe_check(W, D, cols, rows)
+            c = pipe_check(W, D, cols, rows, case)
             if all(c[k] <= 1 for k in RATIOS):
                 t = priced(plan_pipe(W, D, pile="単管", cols=cols, rows=rows)["bom"])[1]
                 if best is None or t < best[0]:
@@ -404,30 +480,48 @@ def safe_layout(W, D):
 SAFE_W = 10.0
 
 
-def check_row(label, W, D, cols, rows):
-    c = pipe_check(W, D, cols, rows)
+def check_row(label, W, D, cols, rows, case=DESIGN_LOAD):
+    c = pipe_check(W, D, cols, rows, case)
     return (f"| {label} | {c['配置']} | {c['間隔']} | " + " | ".join(f"{c[k]:.2f}" for k in RATIOS[:-1])
             + f" | {c['杭1本の荷重kN']:.2f}kN({c['杭1本の荷重']:.2f}) |")
 
 
 def pipe_safe_section():
     W0, D0 = plan_size("パイプ台")
+    c = LOADS[DESIGN_LOAD]
+    full = LOADS["床いっぱい"]
     head = ("| 案 | 杭の配置(列×行) | 杭の間隔(横×縦) | 梁の曲げ | 梁のたわみ | 根太の曲げ | 根太のたわみ "
             "| 杭1本の荷重 |")
     sep = "|---|---|---|---:|---:|---:|---:|---:|"
     L = ["", "## 強さの確かめ", "",
-         f"床いっぱいに人が乗っても({LIVE}kN/m²、床の重さ {DEAD}kN/m² を足す)持つように、杭の配置を決めた。"
-         "構造は杭・単管の梁・根太・床板だけで、筋交いや二重の梁は使わない。",
-         "", "合格の条件は次の 3 つ。その中で一番安い配置にした。表の比は 1 以下で合格。", "",
+         "使い方に合わせて、次の荷重で杭の配置を決めた。構造は杭・単管の梁・根太・床板だけで、筋交いや二重の梁は使わない。",
+         "",
+         f"- 射手: 体重 {c['person'] * 100:.0f}kg の人が横に 1m おきに立つ。立つ位置は前の端から "
+         f"{c['stand'][0]}〜{c['stand'][1]}m の間のどこでもよい。1 人の重さは根太 {PERSON_JOISTS} 本で受ける",
+         f"- 荷物置き場: 前の端から {c['front']}m より後ろ。荷物は {c['luggage']}kN/m²(1m² に約 "
+         f"{c['luggage'] * 100:.0f}kg)",
+         f"- 床板と根太の重さ: 全面に {DEAD}kN/m²",
+         "",
+         "合格の条件は次の 3 つ。その中で一番安い配置にした。表の比は 1 以下で合格。", "",
          f"- 単管の梁と赤松の根太が、長期許容曲げ応力以内(単管 {STEEL_FB:.0f}N/mm²、赤松 {WOOD_FB:.1f}N/mm²)",
          f"- たわみがスパンの 1/{DEFL} 以内",
          f"- 杭1本の荷重が、自在クランプ1個で支えられる {CLAMP_KN}kN 以内",
+         "",
+         "梁は人が梁の真ん中に、杭は人が杭の真上に立つとして、一番厳しい所の値を出した。",
          "", head, sep,
          check_row(f"この設計({W0:g}m × {D0:g}m)", W0, D0, *safe_layout(W0, D0))]
     for W, D in [(SAFE_W, 2.0), (SAFE_W, 3.0)]:
         L.append(check_row(f"縦を変えた場合({W:g}m × {D:g}m)", W, D, *safe_layout(W, D)))
-    L.append(check_row(f"杭を 1.8m 間隔にした前の案({SPEC['W']:g}m × {SPEC['D']:g}m)", SPEC["W"], SPEC["D"], None, None))
     L.append(check_row(f"元の案の杭 4×3({W0:g}m × {D0:g}m)", W0, D0, 4, 3))
+    L.append(check_row(f"杭を 1.8m 間隔にした前の案({SPEC['W']:g}m × {SPEC['D']:g}m)",
+                       SPEC["W"], SPEC["D"], None, None))
+    fc, fr = safe_layout(W0, D0, "床いっぱい")
+    ft = priced(plan_pipe(W0, D0, "単管", fc, fr)["bom"])[1]
+    L += ["", f"### 床いっぱいに人が乗る場合({full['live']}kN/m²、住宅の床と同じ荷重)", "",
+          f"後ろにも人が詰めて乗るなら、この設計では足りない。{W0:g}m × {D0:g}m で杭 {fc}×{fr}"
+          f"(杭 {fc * fr} 本)が要り、合計は {yen(ft)}。", "", head, sep,
+          check_row(f"この設計 {W0:g}m × {D0:g}m", W0, D0, *safe_layout(W0, D0), case="床いっぱい"),
+          check_row(f"床いっぱい用の配置 {W0:g}m × {D0:g}m", W0, D0, fc, fr, case="床いっぱい")]
     L += ["", f"### 横 {SAFE_W:g}m で縦を変えた場合の合計", "",
           "| 縦 | 杭の配置 | 合計(単管を切る) | 合計(既製のパイプ杭) |", "|---|---|---:|---:|"]
     for D in (2.0, 2.5, 3.0):
@@ -436,12 +530,12 @@ def pipe_safe_section():
         t2 = priced(plan_pipe(SAFE_W, D, "既製", cols, rows)["bom"])[1]
         L.append(f"| {D:g}m | {cols}×{rows}(杭 {cols * rows} 本) | {yen(t1)} | {yen(t2)} |")
     L += ["", "### 強さの注意", "",
-          "- 梁と根太は単純梁として計算した。実際は継ぎ目の無い所で連続梁になるので、もう少し余裕がある。",
+          "- 梁と根太の曲げ・たわみは単純梁として計算した。実際は継ぎ目の無い所で連続梁になるので、もう少し余裕がある。",
           f"- クランプの許容 {CLAMP_KN}kN は一般的な値で、買う品の表示を確かめていない。表示が低ければ、"
           "梁の下にもう1個クランプを付けて受ける。",
-          "- 杭1本の荷重(約 240kg)を地面が支えられるかは、土によって違う。柔らかい土だと沈む。"
-          "1 本試しに打ち込み、3 人くらい乗って沈まないか確かめる。",
-          "- 射手が 1m おきに並ぶだけなら荷重はこの半分以下で、さらに余裕がある。"]
+          "- 杭1本の荷重を地面が支えられるかは、土によって違う。柔らかい土だと沈む。"
+          "1 本試しに打ち込み、2 人くらい乗って沈まないか確かめる。",
+          "- 荷物置き場に人が何人も入って立つと、この荷重を超える。後ろは荷物だけにする。"]
     return L
 
 
